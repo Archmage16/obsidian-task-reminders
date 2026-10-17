@@ -1,0 +1,18 @@
+[Unit]
+Description=Obsidian task reminders and Telegram controls
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/opt/obsidian-task-reminders
+ExecStart=/usr/bin/python3 -B %h/.local/opt/obsidian-task-reminders/bot_service.py --watch --config %h/.local/share/obsidian-tasks/config.json
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=default.target

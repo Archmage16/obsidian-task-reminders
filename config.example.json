@@ -1,0 +1,8 @@
+{
+  "vault": "/srv/obsidian-vault",
+  "tasks_file": "Задачи.md",
+  "data_directory": "/var/lib/obsidian-tasks",
+  "timezone": "Asia/Qyzylorda",
+  "poll_seconds": 20,
+  "repeat_seconds": 7200
+}

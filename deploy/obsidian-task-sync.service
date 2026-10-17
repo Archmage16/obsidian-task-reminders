@@ -1,0 +1,16 @@
+[Unit]
+Description=Private task file synchronization
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/opt/obsidian-syncthing/syncthing serve --home %h/.local/share/obsidian-tasks/syncthing --no-browser --no-upgrade --no-port-probing
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
