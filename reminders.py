@@ -220,6 +220,39 @@ def attach_ids(source: str, *, assign_missing: bool = True) -> tuple[str, list[M
     return "".join(result), tasks
 
 
+def identified_lines(source: str, task_id: str) -> tuple[list[tuple], bool]:
+    """Locate an exact task UUID outside examples, without changing any IDs."""
+    matches = []
+    fence_char, fence_size = "", 0
+    for index, original in enumerate(source.splitlines(keepends=True)):
+        content = original.rstrip("\r\n")
+        ending = original[len(content):]
+        fence = FENCE.match(content)
+        if fence_char:
+            if fence and fence["ticks"][0] == fence_char and len(fence["ticks"]) >= fence_size and not fence["tail"].strip():
+                fence_char = ""
+            continue
+        if fence:
+            fence_char, fence_size = fence["ticks"][0], len(fence["ticks"])
+            continue
+        match = TASK.match(content)
+        if not match:
+            continue
+        identifiers = []
+        for marker in MARKER.finditer(match["body"]):
+            try:
+                identifiers.append(str(uuid.UUID(marker[1])))
+            except ValueError:
+                continue
+        if task_id in identifiers:
+            clean = MARKER.sub("", match["body"]).strip()
+            title, bell, expression = clean.partition("🔔")
+            expression = " ".join(expression.split()).lower() if bell else None
+            item = MarkdownTask(task_id, title.strip() or "Задача", expression, match["checked"].lower() == "x")
+            matches.append((index, ending, match, item, len(identifiers)))
+    return matches, bool(fence_char)
+
+
 def read_and_attach_ids(path: Path, backup_dir: Path) -> list[MarkdownTask]:
     """Use the locked writer; never fall back to an unsafe read/replace race."""
     try:
@@ -309,6 +342,12 @@ class TaskEngine:
                 CREATE TABLE IF NOT EXISTS relative_anchors (
                     task_id TEXT NOT NULL, expression TEXT NOT NULL, due_utc REAL NOT NULL,
                     PRIMARY KEY(task_id, expression)
+                );
+                CREATE TABLE IF NOT EXISTS deadline_intents (
+                    task_id TEXT NOT NULL, expected_version INTEGER NOT NULL,
+                    requested_expression TEXT NOT NULL, prior_expression TEXT,
+                    target_expression TEXT, due_utc REAL,
+                    PRIMARY KEY(task_id, expected_version, requested_expression)
                 );
             """)
             self._migrate_queue(connection)
@@ -460,6 +499,181 @@ class TaskEngine:
                 return self.fresh_tasks(now=now, _lock_held=True)
         self.sync_tasks(now=now, _lock_held=True)
         return self.list_tasks()
+
+    def _deadline_value(self, expression: str | None, moment: datetime) -> tuple[str | None, float | None, str]:
+        if expression is None:
+            return None, None, ""
+        if (not isinstance(expression, str) or len(expression) > 100 or
+                any(ord(char) < 32 or char in "\x7f\x85\u2028\u2029" for char in expression)):
+            raise ValueError("invalid_deadline")
+        requested = " ".join(expression.split()).lower()
+        due = parse_reminder(requested, moment, self.zone)
+        return due.astimezone(self.zone).strftime("%Y-%m-%d %H:%M"), due.timestamp(), requested
+
+    def _mutation_result(self, status: str, task_id: str) -> dict:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        return {"status":status, "task_id":task_id, "schedule_version":row["schedule_version"],
+                "due_utc":row["due_utc"], "expression":row["expression"]}
+
+    def create_task(self, text: str, deadline_expression: str | None = None, *, task_id: str | None = None,
+                    now: datetime | None = None, _lock_held: bool = False) -> dict:
+        """Append one safe task. A caller-supplied UUID makes retries idempotent."""
+        if (not isinstance(text, str) or not text.strip() or len(text) > 2000 or
+                any(ord(char) < 32 or char in "\x7f\x85\u2028\u2029" or 0xD800 <= ord(char) <= 0xDFFF for char in text) or
+                any(value in text for value in ("🔔", "<!--", "-->", "```", "~~~")) or
+                "obs-task:" in text.lower() or TASK.match(text)):
+            return {"status":"invalid_text"}
+        text = text.strip()
+        try:
+            task_id = str(uuid.uuid4()) if task_id is None else str(uuid.UUID(task_id))
+        except (ValueError, TypeError, AttributeError):
+            return {"status":"invalid_task_id"}
+        if not _lock_held:
+            try:
+                with WorkerLock(self.lock_path):
+                    return self.create_task(text, deadline_expression, task_id=task_id, now=now, _lock_held=True)
+            except AlreadyRunning:
+                return {"status":"busy", "task_id":task_id}
+        try:
+            storage = importlib.import_module("markdown_store")
+            moment = now or utc_now()
+
+            def transform(source: str):
+                try:
+                    expression, due, requested = self._deadline_value(deadline_expression, moment)
+                except ValueError:
+                    return source, ("invalid_deadline", None)
+                relative = re.match(r"^(сегодня|завтра)\s", requested) is not None
+                with self._connection() as connection:
+                    old = connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                    anchor = connection.execute("SELECT due_utc FROM relative_anchors WHERE task_id=? AND expression=?",
+                                                (task_id,requested)).fetchone() if relative else None
+                if anchor is not None:
+                    due = anchor["due_utc"]
+                    expression = datetime.fromtimestamp(due, self.zone).strftime("%Y-%m-%d %H:%M")
+                matches, open_fence = identified_lines(source, task_id)
+                if matches:
+                    if len(matches) != 1 or matches[0][4] != 1:
+                        return source, ("changed", None)
+                    existing = matches[0][3]
+                    if existing.text != text or existing.expression != expression:
+                        return source, ("changed", None)
+                    unused, captured = attach_ids(source, assign_missing=False)
+                    return source, ("already_exists", captured)
+                if old is not None:
+                    # A retry must not resurrect a task manually removed later.
+                    return source, ("changed", None)
+                if open_fence:
+                    return source, ("busy", None)
+                if due is not None and due <= moment.timestamp():
+                    return source, ("invalid_deadline", None)
+                if relative and anchor is None:
+                    with self._connection() as connection:
+                        connection.execute("INSERT INTO relative_anchors(task_id,expression,due_utc) VALUES(?,?,?)",
+                                           (task_id,requested,due))
+                newline = re.search(r"\r\n|\r|\n", source)
+                newline = newline[0] if newline else os.linesep
+                separator = "" if not source or source.endswith(("\r", "\n")) else newline
+                body = text + (f" 🔔 {expression}" if expression is not None else "")
+                updated = source + separator + f"- [ ] {body} <!-- obs-task:{task_id} -->" + newline
+                unused, captured = attach_ids(updated, assign_missing=False)
+                return updated, ("created", captured)
+
+            try:
+                state, captured = storage.update_markdown(self.config.tasks_path, self.data_dir/"markdown-backups", transform)
+            except storage.MarkdownStoreError:
+                return {"status":"busy", "task_id":task_id}
+            if captured is None:
+                return {"status":state, "task_id":task_id}
+            self._sync_tasks(moment, captured=captured)
+            self._write_status(moment, None, configured=None)
+            return self._mutation_result(state, task_id)
+        except (ImportError, sqlite3.Error, OSError, EngineError):
+            return {"status":"busy", "task_id":task_id}
+
+    def set_deadline(self, task_id: str, expected_version: int, deadline_expression: str | None, *,
+                     now: datetime | None = None, _lock_held: bool = False) -> dict:
+        """Change one active task; durable intent recovers write-before-DB crashes."""
+        try:
+            task_id = str(uuid.UUID(task_id))
+        except (ValueError, TypeError, AttributeError):
+            return {"status":"invalid_task_id"}
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or not 1 <= expected_version < 2**63:
+            return {"status":"changed", "task_id":task_id}
+        if not _lock_held:
+            try:
+                with WorkerLock(self.lock_path):
+                    return self.set_deadline(task_id, expected_version, deadline_expression, now=now, _lock_held=True)
+            except AlreadyRunning:
+                return {"status":"busy", "task_id":task_id}
+        try:
+            storage = importlib.import_module("markdown_store")
+            moment = now or utc_now()
+
+            def transform(source: str):
+                try:
+                    expression, due, requested = self._deadline_value(deadline_expression, moment)
+                except ValueError:
+                    return source, ("invalid_deadline", None)
+                matches, unused = identified_lines(source, task_id)
+                if not matches:
+                    return source, ("not_found", None)
+                if len(matches) != 1 or matches[0][4] != 1:
+                    return source, ("changed", None)
+                index, ending, match, item, unused = matches[0]
+                with self._connection() as connection:
+                    row = connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                    intent = connection.execute("""SELECT * FROM deadline_intents
+                        WHERE task_id=? AND expected_version=? AND requested_expression=?""",
+                        (task_id,expected_version,requested)).fetchone()
+                if row is None or row["state"] == "deleted":
+                    return source, ("not_found", None)
+                if item.checked or row["state"] == "completed":
+                    return source, ("changed", None)
+                if intent is not None:
+                    expression, due = intent["target_expression"], intent["due_utc"]
+                replay = (intent is not None and item.expression == expression and
+                          row["schedule_version"] in (expected_version,expected_version+1) and
+                          row["expression"] in (intent["prior_expression"],expression))
+                if replay:
+                    unused, captured = attach_ids(source, assign_missing=False)
+                    return source, ("already_updated", captured)
+                if row["schedule_version"] != expected_version or item.expression != row["expression"]:
+                    return source, ("changed", None)
+                if item.expression == expression:
+                    unused, captured = attach_ids(source, assign_missing=False)
+                    return source, ("already_updated", captured)
+                if due is not None and due <= moment.timestamp():
+                    return source, ("invalid_deadline", None)
+                if intent is not None and intent["prior_expression"] != row["expression"]:
+                    return source, ("changed", None)
+                # Commit proof of this checked operation before the locked writer
+                # changes Markdown; a later foreign edit has no such proof.
+                with self._connection() as connection:
+                    connection.execute("""INSERT INTO deadline_intents(task_id,expected_version,
+                        requested_expression,prior_expression,target_expression,due_utc) VALUES(?,?,?,?,?,?)
+                        ON CONFLICT(task_id,expected_version,requested_expression) DO NOTHING""",
+                        (task_id,expected_version,requested,row["expression"],expression,due))
+                body = item.text + (f" 🔔 {expression}" if expression is not None else "")
+                trailing = match["body"][len(match["body"].rstrip(" \t")):]
+                lines = source.splitlines(keepends=True)
+                lines[index] = match["prefix"] + body + f" <!-- obs-task:{task_id} -->" + trailing + ending
+                updated = "".join(lines)
+                unused, captured = attach_ids(updated, assign_missing=False)
+                return updated, ("updated", captured)
+
+            try:
+                state, captured = storage.update_markdown(self.config.tasks_path, self.data_dir/"markdown-backups", transform)
+            except storage.MarkdownStoreError:
+                return {"status":"busy", "task_id":task_id}
+            if captured is None:
+                return {"status":state, "task_id":task_id}
+            self._sync_tasks(moment, captured=captured)
+            self._write_status(moment, None, configured=None)
+            return self._mutation_result(state, task_id)
+        except (ImportError, sqlite3.Error, OSError, EngineError):
+            return {"status":"busy", "task_id":task_id}
 
     def complete_task(self, task_id: str, expected_version: int | None = None, *, _lock_held: bool = False) -> dict:
         """Complete exactly one existing Markdown task; never send a message."""

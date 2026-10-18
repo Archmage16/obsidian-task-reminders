@@ -857,6 +857,213 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(payload["text"],"😀"*2048)
         self.assertEqual(opened.call_args.kwargs["timeout"],5)
 
+    def test_create_preserves_original_bom_crlf_and_manual_bytes_without_final_newline(self):
+        original=b"\xef\xbb\xbf# Manual\r\n```md\r\n- [ ] example\r\n```\r\n- [ ] existing without ID\r\nTail  "
+        self.taskfile.write_bytes(original)
+        task_id=str(r.uuid.uuid4())
+        with r.WorkerLock(self.engine.lock_path):
+            result=self.engine.create_task("Новое дело","2026-10-17 10:00",task_id=task_id,now=NOW,_lock_held=True)
+        self.assertEqual(result["status"],"created")
+        expected=(f"\r\n- [ ] Новое дело 🔔 2026-10-17 10:00 <!-- obs-task:{task_id} -->\r\n").encode("utf-8")
+        self.assertEqual(self.taskfile.read_bytes(),original+expected)
+        self.assertEqual(result["schedule_version"],1)
+        self.assertEqual(result["due_utc"],(NOW+timedelta(hours=1)).timestamp())
+        self.assertEqual(self.sent,[])
+
+    def test_create_unscheduled_uuid_deduplicates_after_restart_and_conflicts_do_not_mutate(self):
+        first=self.engine.create_task("Без срока",now=NOW)
+        self.assertEqual(first["status"],"created")
+        self.assertIsNone(first["expression"])
+        self.assertEqual(self.rows()[0]["state"],"unscheduled")
+        original=self.taskfile.read_bytes()
+        retry=self.new_engine().create_task("Без срока",task_id=first["task_id"],now=NOW+timedelta(days=1))
+        self.assertEqual(retry["status"],"already_exists")
+        for text,deadline in (("Другое имя",None),("Без срока","2026-10-18 10:00")):
+            self.assertEqual(self.engine.create_task(text,deadline,task_id=first["task_id"],now=NOW)["status"],"changed")
+        self.assertEqual(self.taskfile.read_bytes(),original)
+        self.assertEqual(len(self.rows()),1)
+
+    def test_create_relative_deadline_anchors_once_and_existing_past_retry_is_successful(self):
+        task_id=str(r.uuid.uuid4())
+        result=self.engine.create_task("На завтра","завтра 10:00",task_id=task_id,now=NOW)
+        self.assertEqual(result["expression"],"2026-10-18 10:00")
+        original=self.taskfile.read_bytes()
+        retry=self.new_engine().create_task("На завтра","завтра 10:00",task_id=task_id,now=NOW+timedelta(days=3))
+        self.assertEqual(retry["status"],"already_exists")
+        self.assertEqual(retry["due_utc"],result["due_utc"])
+        self.assertEqual(self.taskfile.read_bytes(),original)
+        self.assertEqual(self.engine.create_task("Новое просроченное","2026-10-18 10:00",now=NOW+timedelta(days=3))["status"],"invalid_deadline")
+
+    def test_create_input_injection_bad_id_and_bad_or_past_deadlines_leave_file_unchanged(self):
+        original=self.taskfile.read_bytes()
+        invalid=(None,"", "  ","a\nb","a\rb","a\tb","a\u2028b","a\x85b","a\x00b",
+                 "a\ud800b","a"*2001,"дело 🔔 2026-10-17 10:00","<!-- obs-task:x -->",
+                 "obs-task:x","text -->","```md","~~~","- [ ] pasted task")
+        for text in invalid:
+            with self.subTest(text=repr(text)):
+                self.assertEqual(self.engine.create_task(text,now=NOW)["status"],"invalid_text")
+        self.assertEqual(self.engine.create_task("Дело",task_id="invalid",now=NOW)["status"],"invalid_task_id")
+        for value in ("",123,"2026-02-29 10:00","2026-10-17 09:00","сегодня 08:59","завтра\n10:00"):
+            with self.subTest(value=value):
+                self.assertEqual(self.engine.create_task("Дело",value,now=NOW)["status"],"invalid_deadline")
+        self.assertEqual(self.taskfile.read_bytes(),original)
+        self.assertEqual(self.rows(),[])
+
+    def test_create_never_resurrects_deleted_uuid_or_unchecks_completed_uuid(self):
+        created=self.engine.create_task("Не воскресать",now=NOW)
+        task_id=created["task_id"]
+        self.engine.complete_task(task_id,1)
+        checked=self.taskfile.read_bytes()
+        self.assertEqual(self.engine.create_task("Не воскресать",task_id=task_id,now=NOW)["status"],"already_exists")
+        self.assertEqual(self.taskfile.read_bytes(),checked)
+        self.write("# Deleted manually\n")
+        # Both an unsynced deletion and its durable tombstone must refuse append.
+        for sync in (False,True):
+            if sync:
+                self.engine.sync_tasks(now=NOW)
+            self.assertEqual(self.new_engine().create_task("Не воскресать",task_id=task_id,now=NOW)["status"],"changed")
+            self.assertEqual(self.taskfile.read_text(encoding="utf-8"),"# Deleted manually\n")
+
+    def test_create_fenced_uuid_is_not_real_and_unclosed_fence_refuses_append(self):
+        task_id=str(r.uuid.uuid4())
+        example=f"```md\n- [ ] Пример <!-- obs-task:{task_id} -->\n```\n"
+        self.write(example)
+        self.assertEqual(self.engine.create_task("Реальное дело",task_id=task_id,now=NOW)["status"],"created")
+        self.assertTrue(self.taskfile.read_text(encoding="utf-8").startswith(example))
+        self.write("```md\nexample\n")
+        before=self.taskfile.read_bytes()
+        self.assertEqual(self.engine.create_task("Не внутри примера",now=NOW)["status"],"busy")
+        self.assertEqual(self.taskfile.read_bytes(),before)
+
+    def test_create_postwrite_queue_failure_retries_same_uuid_without_duplicate(self):
+        task_id=str(r.uuid.uuid4())
+        with mock.patch.object(self.engine,"_sync_tasks",side_effect=r.sqlite3.OperationalError("private-error")):
+            failed=self.engine.create_task("После сбоя","2026-10-17 10:00",task_id=task_id,now=NOW)
+        self.assertEqual(failed["status"],"busy")
+        committed=self.taskfile.read_bytes()
+        self.assertEqual(self.rows(),[])
+        retry=self.new_engine().create_task("После сбоя","2026-10-17 10:00",task_id=task_id,now=NOW)
+        self.assertEqual(retry["status"],"already_exists")
+        self.assertEqual(self.taskfile.read_bytes(),committed)
+        self.assertEqual(len(self.rows()),1)
+
+    def test_create_and_deadline_busy_lock_or_storage_do_not_claim_success(self):
+        created=self.engine.create_task("Занятый файл",now=NOW)
+        task_id=created["task_id"]
+        before=self.taskfile.read_bytes()
+        import markdown_store
+        with r.WorkerLock(self.engine.lock_path):
+            self.assertEqual(self.engine.create_task("Новое",now=NOW)["status"],"busy")
+            self.assertEqual(self.engine.set_deadline(task_id,1,"2026-10-17 10:00",now=NOW)["status"],"busy")
+        with mock.patch.object(markdown_store,"update_markdown",side_effect=markdown_store.MarkdownBusy()):
+            self.assertEqual(self.engine.create_task("Новое",now=NOW)["status"],"busy")
+            self.assertEqual(self.engine.set_deadline(task_id,1,"2026-10-17 10:00",now=NOW)["status"],"busy")
+        self.assertEqual(self.taskfile.read_bytes(),before)
+        self.assertIsNone(self.rows()[0]["due_utc"])
+
+    def test_set_deadline_edits_only_exact_real_line_and_keeps_bom_crlf_fenced_copy(self):
+        task_id=str(r.uuid.uuid4())
+        source=(f"# Notes\r\n```md\r\n- [ ] Example <!-- obs-task:{task_id} -->\r\n```\r\n"
+                f"  * [ ] Actual <!-- obs-task:{task_id} -->  \r\n- [ ] Untouched without ID\r\nTail  ")
+        self.taskfile.write_bytes(b"\xef\xbb\xbf"+source.encode("utf-8"))
+        self.engine._sync_tasks(NOW,captured=r.attach_ids(source,assign_missing=False)[1])
+        before=self.taskfile.read_bytes()
+        result=self.engine.set_deadline(task_id,1,"завтра 10:00",now=NOW)
+        self.assertEqual(result["status"],"updated")
+        self.assertEqual(result["expression"],"2026-10-18 10:00")
+        self.assertEqual(result["schedule_version"],2)
+        old=f"  * [ ] Actual <!-- obs-task:{task_id} -->  ".encode()
+        new=f"  * [ ] Actual 🔔 2026-10-18 10:00 <!-- obs-task:{task_id} -->  ".encode()
+        self.assertEqual(self.taskfile.read_bytes(),before.replace(old,new,1))
+
+    def test_set_deadline_clear_stops_repeat_and_new_future_schedule_restarts_first_delivery(self):
+        self.enable_repeats()
+        created=self.engine.create_task("Сменить срок","2026-10-17 09:01",now=NOW)
+        task_id=created["task_id"]
+        self.authorize()
+        due=NOW+timedelta(minutes=1)
+        self.engine.run_once(now=due)
+        cleared=self.engine.set_deadline(task_id,1,None,now=due)
+        self.assertEqual(cleared["status"],"updated")
+        row=self.rows()[0]
+        self.assertEqual(row["state"],"unscheduled")
+        self.assertIsNone(row["next_reminder_utc"])
+        self.assertEqual(row["reminder_count"],0)
+        changed=self.engine.set_deadline(task_id,2,"2026-10-17 10:00",now=due)
+        self.assertEqual(changed["schedule_version"],3)
+        self.engine.run_once(now=NOW+timedelta(minutes=59))
+        self.assertEqual(len(self.sent),1)
+        self.engine.run_once(now=NOW+timedelta(hours=1))
+        self.assertEqual(len(self.sent),2)
+        self.assertIn("🔔 Напоминание",self.sent[-1][1])
+        self.assertEqual(self.rows()[0]["next_reminder_utc"],(NOW+timedelta(hours=3)).timestamp())
+
+    def test_set_deadline_foreign_unsynced_edit_stale_version_and_completed_are_rejected(self):
+        created=self.engine.create_task("Проверка версии","2026-10-17 10:00",now=NOW)
+        task_id=created["task_id"]
+        self.write(self.taskfile.read_text(encoding="utf-8").replace("10:00","11:00"))
+        before=self.taskfile.read_bytes()
+        # Even requesting the same new expression needs our own durable intent.
+        self.assertEqual(self.engine.set_deadline(task_id,1,"2026-10-17 11:00",now=NOW)["status"],"changed")
+        self.assertEqual(self.taskfile.read_bytes(),before)
+        self.engine.sync_tasks(now=NOW)
+        self.assertEqual(self.engine.set_deadline(task_id,1,"2026-10-17 12:00",now=NOW)["status"],"changed")
+        self.engine.complete_task(task_id,2)
+        before=self.taskfile.read_bytes()
+        self.assertEqual(self.engine.set_deadline(task_id,2,None,now=NOW)["status"],"changed")
+        self.assertEqual(self.taskfile.read_bytes(),before)
+
+    def test_set_deadline_duplicate_uuid_missing_invalid_version_and_past_are_safe(self):
+        created=self.engine.create_task("Проверка",now=NOW)
+        task_id=created["task_id"]
+        before=self.taskfile.read_bytes()
+        for value in ("2026-10-17 09:00","2026-02-29 10:00","завтра\n10:00",123):
+            self.assertEqual(self.engine.set_deadline(task_id,1,value,now=NOW)["status"],"invalid_deadline")
+        for version in (0,-1,True,None,"1",2**63):
+            self.assertEqual(self.engine.set_deadline(task_id,version,None,now=NOW)["status"],"changed")
+        self.assertEqual(self.engine.set_deadline("bad",1,None,now=NOW)["status"],"invalid_task_id")
+        self.assertEqual(self.engine.set_deadline(str(r.uuid.uuid4()),1,None,now=NOW)["status"],"not_found")
+        self.assertEqual(self.taskfile.read_bytes(),before)
+        self.write(before.decode("utf-8")+before.decode("utf-8"))
+        duplicate=self.taskfile.read_bytes()
+        self.assertEqual(self.engine.set_deadline(task_id,1,"2026-10-17 10:00",now=NOW)["status"],"changed")
+        self.assertEqual(self.taskfile.read_bytes(),duplicate)
+
+    def test_set_deadline_write_then_queue_failure_recovers_durable_intent_after_restart(self):
+        created=self.engine.create_task("Сбой после записи",now=NOW)
+        task_id=created["task_id"]
+        with mock.patch.object(self.engine,"_sync_tasks",side_effect=r.sqlite3.OperationalError("private-error")):
+            failed=self.engine.set_deadline(task_id,1,"завтра 10:00",now=NOW)
+        self.assertEqual(failed["status"],"busy")
+        written=self.taskfile.read_bytes()
+        self.assertIn("2026-10-18 10:00".encode(),written)
+        self.assertEqual(self.rows()[0]["schedule_version"],1)
+        restarted=self.new_engine()
+        result=restarted.set_deadline(task_id,1,"завтра 10:00",now=NOW+timedelta(hours=1))
+        self.assertEqual(result["status"],"already_updated")
+        self.assertEqual(result["schedule_version"],2)
+        self.assertEqual(self.taskfile.read_bytes(),written)
+        self.assertEqual(restarted.set_deadline(task_id,1,"завтра 10:00",now=NOW+timedelta(days=2))["status"],"already_updated")
+        self.assertEqual(self.rows()[0]["schedule_version"],2)
+
+    def test_set_deadline_idempotent_replay_preserves_delivered_repeat_and_rejects_later_edit(self):
+        self.enable_repeats()
+        created=self.engine.create_task("Повтор не сбрасывается",now=NOW)
+        task_id=created["task_id"]
+        result=self.engine.set_deadline(task_id,1,"2026-10-17 09:30",now=NOW)
+        self.assertEqual(result["status"],"updated")
+        self.authorize()
+        due=NOW+timedelta(minutes=30)
+        self.engine.run_once(now=due)
+        original=self.rows()[0]
+        replay=self.new_engine().set_deadline(task_id,1,"2026-10-17 09:30",now=NOW+timedelta(hours=1))
+        self.assertEqual(replay["status"],"already_updated")
+        current=self.rows()[0]
+        for key in ("schedule_version","due_utc","next_reminder_utc","delivered_utc","reminder_count"):
+            self.assertEqual(current[key],original[key])
+        self.assertEqual(self.engine.set_deadline(task_id,2,"2026-10-17 11:00",now=due)["status"],"updated")
+        self.assertEqual(self.engine.set_deadline(task_id,1,"2026-10-17 09:30",now=due)["status"],"changed")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -88,7 +88,7 @@ class ControlsTests(unittest.TestCase):
         self.assertTrue(self.controls.publish_menu(TOKEN, OWNER)["published"])
         sent = self.transport.sent()[0]
         buttons = sum(sent["reply_markup"]["inline_keyboard"], [])
-        self.assertEqual([b["callback_data"] for b in buttons], ["list:tasks:active:0", "list:deadlines:active:0", "test:ping", "test:minute", "test:status"])
+        self.assertEqual([b["callback_data"] for b in buttons], ["list:tasks:active:0", "list:deadlines:active:0", "draft:add", "test:ping", "test:minute", "test:status"])
         self.assertIn("каждые 2 часа", sent["text"])
         self.assertIn("в указанный срок", sent["text"])
         self.assertNotIn("PRIVATE", json.dumps(sent))
@@ -543,6 +543,279 @@ class ControlsTests(unittest.TestCase):
             self.assertIn("1. ☐ ", sent["text"])
             done = [button for button in sum(sent["reply_markup"]["inline_keyboard"], []) if button["callback_data"].startswith("done:")]
             self.assertEqual(done, [{"text": "✅ 1", "callback_data": f"done:{TASK}:3"}])
+
+    def draft(self):
+        db = sqlite3.connect(Path(self.temp.name) / "controls.sqlite3")
+        db.row_factory = sqlite3.Row
+        try:
+            row = db.execute("SELECT * FROM drafts WHERE owner=?", (OWNER,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            db.close()
+
+    def quick(self, update_id, choice="none", now=STAMP):
+        return self.process(callback(update_id, f"draft:{self.draft()['nonce']}:{choice}"), now)
+
+    def test_persistent_create_two_step_normalizes_relative_deadline(self):
+        calls = []
+        create = lambda *args: calls.append(args) or {"status": "created"}
+        self.controls = self.make(create_task_handler=create)
+        self.process(callback(1, "draft:add"))
+        self.assertEqual(self.draft()["step"], "title")
+        self.process(message(2, "PRIVATE NEW TITLE"))
+        draft_id = self.draft()["id"]
+        self.assertEqual(self.draft()["step"], "deadline")
+        self.controls = self.make(create_task_handler=create)
+        self.process(message(3, "завтра 09:00"))
+        local = dt.datetime.fromtimestamp(STAMP, dt.timezone.utc).astimezone(bc._ASTANA)
+        expected = (local + dt.timedelta(days=1)).strftime("%Y-%m-%d") + " 09:00"
+        self.assertEqual(calls, [(draft_id, "PRIVATE NEW TITLE", expected)])
+        self.assertIsNone(self.draft())
+        self.assertIn("Сохранено на сервере", self.transport.sent()[-1]["text"])
+        self.assertIn("после синхронизации", self.transport.sent()[-1]["text"])
+        summary = self.controls.tick(TOKEN, OWNER, STAMP + 1)
+        self.assertNotIn("PRIVATE NEW TITLE", json.dumps(summary))
+
+    def test_add_prefilled_title_and_quick_none(self):
+        calls = []
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "created"})
+        self.process(message(1, "/add Сдать проект"))
+        self.assertEqual(self.draft()["step"], "deadline")
+        self.quick(2)
+        self.assertEqual(calls[0][1:], ("Сдать проект", None))
+        self.assertEqual(self.sql("SELECT state,notified FROM intents"), [("done", 1)])
+
+    def test_quick_two_hours_and_tomorrow_are_absolute_and_future(self):
+        calls = []
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "created"})
+        now = STAMP + 37
+        self.process(message(1, "/add TWO HOURS", date=now), now)
+        self.quick(2, "twohours", now)
+        first = dt.datetime.strptime(calls[-1][2], "%Y-%m-%d %H:%M").replace(tzinfo=bc._ASTANA).timestamp()
+        self.assertGreaterEqual(first - now, 7200)
+        self.assertLess(first - now, 7260)
+        self.process(message(3, "/add TOMORROW", date=now), now)
+        self.quick(4, "tomorrow", now)
+        self.assertTrue(calls[-1][2].endswith(" 09:00"))
+        second = dt.datetime.strptime(calls[-1][2], "%Y-%m-%d %H:%M").replace(tzinfo=bc._ASTANA)
+        self.assertEqual(second.date(), dt.datetime.fromtimestamp(now, bc._ASTANA).date() + dt.timedelta(days=1))
+
+    def test_bad_dates_and_past_leave_draft_without_engine_call(self):
+        calls = []
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args))
+        self.process(message(1, "/add DATE TASK"))
+        for index, text in enumerate(("18.10.2026 20:00", "2026-02-30 10:00", "завтра 25:00", "2020-01-01 10:00"), 2):
+            self.process(message(index, text))
+            self.assertEqual(self.draft()["step"], "deadline")
+        self.assertEqual(calls, [])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM intents")[0][0], 0)
+        self.assertIn("уже прошёл", self.transport.sent()[-1]["text"])
+
+    def test_bad_titles_rejected_friendly_and_cannot_inject_markdown_task(self):
+        self.process(message(1, "/add"))
+        for index, title in enumerate(("a\nb", "x" * 2001, "task 🔔 завтра 09:00", "<!-- obs-task:x -->", "```text", "a\x00b"), 2):
+            self.process(message(index, title))
+            self.assertEqual(self.draft()["step"], "title")
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM intents")[0][0], 0)
+        self.process(message(9, "Correct title 😀"))
+        self.assertEqual(self.draft()["step"], "deadline")
+
+    def test_freeform_outside_flow_and_unauthorized_inputs_do_not_create_draft(self):
+        self.process(message(1, "random text"))
+        self.process(message(2, "завтра 09:00"))
+        self.process(message(3, "/add PRIVATE", user=777))
+        self.process(message(4, "/add PRIVATE", kind="group"))
+        self.process(callback(5, "draft:add", user=777))
+        self.process(message(6, "/add OLD", date=STAMP - 301))
+        self.assertIsNone(self.draft())
+        self.assertEqual(self.transport.sent(), [])
+
+    def test_cancel_and_old_nonce_cannot_cancel_or_submit_new_draft(self):
+        calls = []
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "created"})
+        self.process(message(1, "/add FIRST"))
+        old = self.draft()["nonce"]
+        self.process(message(2, "/cancel"))
+        self.assertIsNone(self.draft())
+        self.process(message(3, "/add SECOND"))
+        current = self.draft()["id"]
+        self.process(callback(4, f"draft:{old}:cancel"))
+        self.process(callback(5, f"draft:{old}:none"))
+        self.assertEqual(self.draft()["id"], current)
+        self.assertEqual(calls, [])
+        self.quick(6)
+        self.assertEqual(calls[0][1], "SECOND")
+
+    def test_draft_expiry_and_pending_intent_not_expired(self):
+        self.process(message(1, "/add EXPIRING"))
+        self.controls.tick(TOKEN, OWNER, STAMP + 3601)
+        self.assertIsNone(self.draft())
+        calls = []
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "busy"})
+        self.process(message(2, "/add DURABLE", date=STAMP + 3602), STAMP + 3602)
+        self.quick(3, now=STAMP + 3602)
+        stable = self.draft()["id"]
+        self.controls.tick(TOKEN, OWNER, STAMP + 7204)
+        self.assertEqual(self.draft()["id"], stable)
+        self.assertEqual(self.draft()["step"], "pending")
+        self.assertEqual(calls[0], calls[-1])
+
+    def test_duplicate_final_update_and_callback_never_duplicate_creation(self):
+        calls = []
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "created"})
+        self.process(message(1, "/add ONCE"))
+        nonce = self.draft()["nonce"]
+        final = callback(2, f"draft:{nonce}:none")
+        self.process(final)
+        self.process(final)
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "created"})
+        self.process(callback(3, f"draft:{nonce}:none", callback_id="cb-2"))
+        self.process(callback(4, f"draft:{nonce}:none"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM intents")[0][0], 1)
+
+    def test_busy_retries_same_uuid_without_message_flood_and_can_cancel(self):
+        calls = []
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "busy"})
+        self.process(message(1, "/add BUSY"))
+        self.quick(2)
+        count = len(self.transport.sent())
+        self.controls.tick(TOKEN, OWNER, STAMP + 5)
+        self.controls.tick(TOKEN, OWNER, STAMP + 10)
+        self.assertEqual(len(self.transport.sent()), count)
+        self.assertEqual(calls[0], calls[1])
+        self.process(message(3, "/cancel", date=STAMP + 11), STAMP + 11)
+        self.controls.tick(TOKEN, OWNER, STAMP + 20)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.sql("SELECT state FROM intents"), [("cancelled",)])
+
+    def test_busy_then_success_and_transport_confirmation_retry_only(self):
+        calls = []
+        def create(*args):
+            calls.append(args)
+            return {"status": "busy" if len(calls) == 1 else "created"}
+        self.controls = self.make(create_task_handler=create)
+        self.process(message(1, "/add PRIVATE PERSIST"))
+        self.quick(2)
+        self.transport.fail.add("sendMessage")
+        self.controls.tick(TOKEN, OWNER, STAMP + 5)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.sql("SELECT state,notified FROM intents"), [("done", 0)])
+        self.transport.fail.clear()
+        self.controls = self.make(create_task_handler=create)
+        self.controls.tick(TOKEN, OWNER, STAMP + 6)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.sql("SELECT state,notified FROM intents"), [("done", 1)])
+        self.assertNotIn("PRIVATE PERSIST", json.dumps(self.controls._summary()))
+
+    def test_crash_after_handler_effect_retries_stable_idempotent_intent(self):
+        calls, created = [], set()
+        def create(*args):
+            calls.append(args)
+            if args[0] not in created:
+                created.add(args[0])
+                raise KeyboardInterrupt("simulated process crash")
+            return {"status": "already_exists"}
+        self.controls = self.make(create_task_handler=create)
+        self.process(message(1, "/add CRASH"))
+        with self.assertRaises(KeyboardInterrupt):
+            self.quick(2)
+        self.assertEqual(self.sql("SELECT state FROM intents"), [("pending",)])
+        self.controls = self.make(create_task_handler=create)
+        self.controls.tick(TOKEN, OWNER, STAMP + 5)
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(len(created), 1)
+        self.assertEqual(self.sql("SELECT state FROM intents"), [("done",)])
+
+    def test_mutation_intent_committed_atomically_with_update_claim(self):
+        calls = []
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "created"})
+        self.process(message(1, "/add COMMITTED"))
+        with patch.object(self.controls, "_flush_intents", side_effect=sqlite3.OperationalError("simulated stop before handler")):
+            result = self.quick(2)
+        self.assertEqual(result["error"], "storage_unavailable")
+        self.assertEqual(calls, [])
+        self.assertEqual(self.sql("SELECT id FROM updates ORDER BY id"), [(1,), (2,)])
+        self.assertEqual(self.sql("SELECT state FROM intents"), [("pending",)])
+        self.controls = self.make(create_task_handler=lambda *args: calls.append(args) or {"status": "created"})
+        self.controls.tick(TOKEN, OWNER, STAMP + 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_edit_flow_validates_version_and_uses_original_uuid(self):
+        calls = []
+        rows = [{"task_id": TASK, "schedule_version": 7, "text": "EDIT", "state": "pending", "due_utc": STAMP + 60}]
+        self.controls = self.make(task_provider=lambda: rows, set_deadline_handler=lambda *args: calls.append(args) or {"status": "updated"})
+        self.process(callback(1, f"date:{TASK}:6"))
+        self.assertIsNone(self.draft())
+        self.process(callback(2, f"date:{TASK}:7"))
+        self.assertEqual(self.draft()["mode"], "edit")
+        self.quick(3, "none")
+        self.assertEqual(calls, [(TASK, 7, None)])
+        self.assertIn("Срок задачи обновлён", self.transport.sent()[-1]["text"])
+
+    def test_edit_conflict_after_prompt_clears_flow_and_does_not_claim_success(self):
+        rows = [{"task_id": TASK, "schedule_version": 7, "text": "EDIT", "state": "pending"}]
+        self.controls = self.make(task_provider=lambda: rows, set_deadline_handler=lambda *_: {"status": "changed"})
+        self.process(callback(1, f"date:{TASK}:7"))
+        self.quick(2, "tomorrow")
+        self.assertIsNone(self.draft())
+        self.assertIn("Задача изменилась", self.transport.sent()[-1]["text"])
+        self.assertNotIn("Сохранено на сервере", self.transport.sent()[-1]["text"])
+
+    def test_old_edit_keyboard_cannot_replace_new_create_draft_and_completed_no_flow(self):
+        rows = [{"task_id": TASK, "schedule_version": 7, "text": "EDIT", "state": "pending"}]
+        self.controls = self.make(task_provider=lambda: rows)
+        self.process(message(1, "/add KEEP"))
+        draft_id = self.draft()["id"]
+        self.process(callback(2, f"date:{TASK}:7"))
+        self.assertEqual(self.draft()["id"], draft_id)
+        self.assertIn("Сначала завершите", self.transport.sent()[-1]["text"])
+        self.process(message(3, "/cancel"))
+        rows[0]["state"] = "completed"
+        self.process(callback(4, f"date:{TASK}:7"))
+        self.assertIsNone(self.draft())
+
+    def test_edit_and_draft_callbacks_require_owner_private_and_ack_precedes_provider(self):
+        events = []
+        rows = [{"task_id": TASK, "schedule_version": 7, "text": "EDIT", "state": "pending"}]
+        original = self.transport.__call__
+        def transport(*args, **kwargs):
+            events.append(args[1])
+            return original(*args, **kwargs)
+        self.controls = bc.BotControls(self.temp.name, lambda: self.status, transport, now=STAMP,
+                                      task_provider=lambda: events.append("provider") or rows)
+        self.process(callback(1, f"date:{TASK}:7", user=777))
+        self.assertEqual(events, [])
+        self.process(callback(2, f"date:{TASK}:7"))
+        self.assertEqual(events[:2], ["answerCallbackQuery", "provider"])
+        nonce = self.draft()["nonce"]
+        self.process(callback(3, f"draft:{nonce}:none", kind="group"))
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM intents")[0][0], 0)
+
+    def test_scope_changes_clear_private_drafts_and_pending_intents(self):
+        self.controls = self.make(create_task_handler=lambda *_: {"status": "busy"})
+        self.process(message(1, "/add PRIVATE DRAFT"))
+        self.quick(2)
+        self.controls.tick("900002:fake_other_bot", OWNER)
+        self.assertIsNone(self.draft())
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM intents")[0][0], 0)
+        self.controls.process_update("900002:fake_other_bot", OWNER, message(3, "/add PRIVATE SECOND"), STAMP)
+        self.controls.tick("900002:fake_other_bot", OWNER + 1)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM drafts")[0][0], 0)
+
+    def test_flow_callbacks_size_and_date_buttons_only_for_active_valid_rows(self):
+        rows = [{"task_id": TASK, "schedule_version": 7, "text": "ACTIVE", "state": "pending"},
+                {"task_id": "bad", "schedule_version": 7, "text": "MALFORMED", "state": "pending"},
+                {"task_id": "22222222-2222-4222-8222-222222222222", "schedule_version": 7, "text": "DONE", "state": "completed"}]
+        self.controls = self.make(task_provider=lambda: rows)
+        self.process(callback(1, "list:tasks:all:0"))
+        buttons = sum(self.transport.sent()[-1]["reply_markup"]["inline_keyboard"], [])
+        dates = [button for button in buttons if button["callback_data"].startswith("date:")]
+        self.assertEqual(len(dates), 1)
+        self.assertEqual(dates[0]["callback_data"], f"date:{TASK}:7")
+        self.process(message(2, "/add FLOW"))
+        for button in sum(self.transport.sent()[-1]["reply_markup"]["inline_keyboard"], []):
+            self.assertLessEqual(len(button["callback_data"].encode()), 64)
 
 
 if __name__ == "__main__":

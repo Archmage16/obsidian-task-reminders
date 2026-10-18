@@ -4,7 +4,10 @@ The embedding service owns the worker lock. Network delivery is at least once:
 a crash after Telegram accepts a test message but before SQLite records success
 can repeat that message after restart. Callback effects are durably claimed before
 execution, so replay does not repeat them; a failed action asks the owner to click
-again. Only public bot IDs, update/callback IDs and test-job metadata are stored.
+again. This private SQLite database also contains task titles in conversation
+drafts and durable creation/deadline intents. They are never included in status
+or error logs. Mutation intents are committed with the update claim, retried with
+stable task IDs, and their delivery confirmations are retried independently.
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+import uuid
 import urllib.error
 import urllib.request
 from typing import Callable
@@ -25,6 +29,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 _TOKEN = re.compile(r"^[1-9][0-9]*:[A-Za-z0-9_-]+$")
 _DONE = re.compile(r"^done:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}):([0-9]{1,18})$")
 _VIEW = re.compile(r"^list:(tasks|deadlines):(active|completed|all):([0-9]{1,9})$")
+_EDIT = re.compile(r"^date:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}):([0-9]{1,18})$")
+_DRAFT = re.compile(r"^draft:([a-f0-9]{16}):(twohours|tomorrow|none|cancel)$")
+_DATE_INPUT = re.compile(r"^(\d{4}-\d{2}-\d{2}|сегодня|завтра)\s+(\d{1,2}):(\d{2})$", re.I)
+_DRAFT_TTL = 3600
 _METHODS = frozenset({"getUpdates", "sendMessage", "answerCallbackQuery"})
 try:
     _ASTANA = ZoneInfo("Asia/Qyzylorda")
@@ -148,7 +156,8 @@ def _due_timestamp(value):
 
 class BotControls:
     def __init__(self, data_dir, status_provider: Callable[[], dict], transport=None,
-                 now=None, *, complete_task_handler=None, task_provider=None):
+                 now=None, *, complete_task_handler=None, task_provider=None,
+                 create_task_handler=None, set_deadline_handler=None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "controls.sqlite3"
@@ -157,6 +166,8 @@ class BotControls:
         self.clock = now if callable(now) else (lambda: now) if now is not None else time.time
         self.complete_task_handler = complete_task_handler
         self.task_provider = task_provider
+        self.create_task_handler = create_task_handler
+        self.set_deadline_handler = set_deadline_handler
         with self._db() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -167,6 +178,16 @@ class BotControls:
                 CREATE TABLE IF NOT EXISTS jobs(
                     id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, due REAL NOT NULL,
                     state TEXT NOT NULL, generation INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS drafts(
+                    owner INTEGER PRIMARY KEY, id TEXT NOT NULL, nonce TEXT NOT NULL,
+                    mode TEXT NOT NULL, step TEXT NOT NULL, title TEXT NOT NULL,
+                    task_id TEXT, expected_version INTEGER, expires REAL NOT NULL, intent_id TEXT);
+                CREATE TABLE IF NOT EXISTS intents(
+                    id TEXT PRIMARY KEY, owner INTEGER NOT NULL, draft_id TEXT NOT NULL,
+                    kind TEXT NOT NULL, task_id TEXT NOT NULL, expected_version INTEGER,
+                    title TEXT NOT NULL, deadline_expression TEXT, state TEXT NOT NULL,
+                    retry_at REAL NOT NULL, expires REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    result TEXT, notified INTEGER NOT NULL DEFAULT 0, notice TEXT NOT NULL DEFAULT '');
             """)
             # Only one service holds the external worker lock, so an interrupted
             # send can be safely retried by the newly constructed controller.
@@ -195,6 +216,7 @@ class BotControls:
         return {"inline_keyboard": [
             [{"text": "📝 Задачи", "callback_data": "list:tasks:active:0"},
              {"text": "📅 Дедлайны", "callback_data": "list:deadlines:active:0"}],
+            [{"text": "➕ Добавить задачу", "callback_data": "draft:add"}],
             [{"text": "✅ Проверить связь", "callback_data": "test:ping"}],
             [{"text": "⏱ Тест через 1 минуту", "callback_data": "test:minute"},
              {"text": "📋 Статус", "callback_data": "test:status"}]]}
@@ -238,6 +260,8 @@ class BotControls:
             if (old and old != identity) or (previous_owner and previous_owner != str(owner)):
                 db.execute("UPDATE jobs SET state='cancelled' WHERE state IN ('pending','sending')")
                 self._set(db, "generation", int(self._meta(db, "generation")) + 1)
+                db.execute("DELETE FROM drafts")
+                db.execute("DELETE FROM intents")
             self._set(db, "bot_id", identity)
             self._set(db, "owner", owner)
 
@@ -265,6 +289,7 @@ class BotControls:
                 result = {
                     "last_poll": self._meta(db, "last_poll", "") or None,
                     "pending_tests": db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('pending','sending')").fetchone()[0],
+                    "pending_actions": db.execute("SELECT COUNT(*) FROM intents WHERE state='pending'").fetchone()[0],
                     "error": error,
                     "counts": {name: 0 for name in _COUNT_NAMES}}
                 result["counts"].update({row[0]: row[1] for row in db.execute("SELECT name,value FROM counts")
@@ -281,6 +306,7 @@ class BotControls:
     def _menu_text(self):
         return ("Задачи и напоминания\n\n"
                 "«Задачи» — список с фильтрами. «Дедлайны» — исходные сроки, включая просроченные.\n"
+                "«Добавить задачу» — название и срок. Кнопка 🕒 рядом с задачей меняет её срок.\n"
                 "Тест через минуту не создаёт задачу в Obsidian.\n"
                 "Напоминание о задаче придёт в указанный срок, затем каждые 2 часа, "
                 "пока вы не отметите её выполненной.\n\nВремя Астаны (UTC+05).")
@@ -333,6 +359,9 @@ class BotControls:
         done_buttons = [{"text": f"✅ {number}", "callback_data": payload}
                         for number, payload in visible_tasks]
         rows.extend(done_buttons[index:index + 3] for index in range(0, len(done_buttons), 3))
+        date_buttons = [{"text": f"🕒 {number}", "callback_data": "date:" + payload.removeprefix("done:")}
+                        for number, payload in visible_tasks]
+        rows.extend(date_buttons[index:index + 3] for index in range(0, len(date_buttons), 3))
         navigation = []
         if page > 0:
             navigation.append({"text": "← Назад", "callback_data": f"list:{view}:{state_filter}:{page - 1}"})
@@ -432,6 +461,219 @@ class BotControls:
         return text, self._view_keyboard(view, state_filter, page, len(pages), pages[page][1])
 
     @staticmethod
+    def _nonce():
+        return uuid.uuid4().hex[:16]
+
+    @staticmethod
+    def _valid_title(value):
+        if not isinstance(value, str):
+            return False
+        value = value.strip()
+        return (0 < len(value) <= 2000 and not re.search(r"[\x00-\x1f\x7f-\x9f]", value)
+                and not any(part in value for part in ("🔔", "<!--", "-->", "```", "~~~", "obs-task:"))
+                and not any(0xD800 <= ord(char) <= 0xDFFF for char in value))
+
+    @staticmethod
+    def _deadline(value, stamp):
+        """Match the engine's date grammar; normalize relative dates exactly once."""
+        match = _DATE_INPUT.fullmatch(value.strip()) if isinstance(value, str) else None
+        if not match:
+            return None, "format"
+        try:
+            local = dt.datetime.fromtimestamp(stamp, dt.timezone.utc).astimezone(_ASTANA)
+            day = match[1].lower()
+            if day in ("сегодня", "завтра"):
+                date = local.date() + dt.timedelta(days=day == "завтра")
+            else:
+                date = dt.datetime.strptime(day, "%Y-%m-%d").date()
+            target = dt.datetime(date.year, date.month, date.day, int(match[2]), int(match[3]), tzinfo=_ASTANA)
+            if target.timestamp() <= stamp:
+                return None, "past"
+            return target.strftime("%Y-%m-%d %H:%M"), None
+        except (ValueError, OverflowError, OSError):
+            return None, "format"
+
+    @staticmethod
+    def _expire_drafts(db, stamp):
+        # A committed mutation intent must survive until success or explicit
+        # cancellation, even when the originating conversation is over an hour old.
+        db.execute("DELETE FROM drafts WHERE expires<=? AND step!='pending'", (stamp,))
+
+    def _draft_keyboard(self, draft):
+        nonce = draft["nonce"]
+        rows = []
+        if draft["step"] == "deadline":
+            rows = [[{"text": "Через 2 часа", "callback_data": f"draft:{nonce}:twohours"},
+                     {"text": "Завтра 09:00", "callback_data": f"draft:{nonce}:tomorrow"}],
+                    [{"text": "Без срока", "callback_data": f"draft:{nonce}:none"}]]
+        rows.append([{"text": "Отмена", "callback_data": f"draft:{nonce}:cancel"}])
+        return {"inline_keyboard": rows}
+
+    def _draft_prompt(self, draft, note=None):
+        if draft["step"] == "title":
+            text = "Напишите название задачи одним сообщением (до 2000 символов).\nДля отмены: /cancel."
+        elif draft["step"] == "pending":
+            text = "Сохранение ожидает доступа к файлу. Повторю автоматически; для отмены: /cancel."
+        else:
+            title = _text_chunks(_clean_text(draft["title"]), 240)[0]
+            text = (f"{'Новый срок' if draft['mode'] == 'edit' else 'Срок задачи'}: {title}\n\n"
+                    "Напишите YYYY-MM-DD HH:MM, «сегодня HH:MM» или «завтра HH:MM».\n"
+                    "Например: завтра 18:00. Можно выбрать кнопку ниже.\nВремя Астаны (UTC+05).")
+        return ((note + "\n\n") if note else "") + text, self._draft_keyboard(draft)
+
+    def _start_draft(self, db, owner, stamp, title=None):
+        self._expire_drafts(db, stamp)
+        old = db.execute("SELECT * FROM drafts WHERE owner=?", (owner,)).fetchone()
+        if old:
+            return {"action": "flow_prompt"}
+        task_id, nonce = str(uuid.uuid4()), self._nonce()
+        valid = self._valid_title(title) if title is not None else False
+        db.execute("INSERT INTO drafts(owner,id,nonce,mode,step,title,expires) VALUES(?,?,?,'create',?,?,?)",
+                   (owner, task_id, nonce, "deadline" if valid else "title", title.strip() if valid else "", stamp + _DRAFT_TTL))
+        return {"action": "flow_prompt", "note": None if title is None or valid else "Название не подходит. Используйте одну строку без 🔔, служебных комментариев и блоков кода."}
+
+    def _cancel_draft(self, db, owner, stamp, nonce=None):
+        self._expire_drafts(db, stamp)
+        draft = db.execute("SELECT * FROM drafts WHERE owner=?", (owner,)).fetchone()
+        if nonce is not None and (not draft or draft["nonce"] != nonce):
+            return {"action": "flow_notice", "notice": "Эта кнопка больше не относится к текущему диалогу. Используйте /add или /cancel."}
+        # Only pending intents are cancelled; a saved task is never undone here.
+        db.execute("UPDATE intents SET state='cancelled',notified=1 WHERE owner=? AND state='pending'", (owner,))
+        db.execute("DELETE FROM drafts WHERE owner=?", (owner,))
+        return {"action": "flow_notice", "notice": "Диалог закрыт."}
+
+    def _queue_intent(self, db, owner, draft, expression, stamp):
+        intent_id = str(uuid.uuid4())
+        task_id = draft["id"] if draft["mode"] == "create" else draft["task_id"]
+        db.execute("""INSERT INTO intents(id,owner,draft_id,kind,task_id,expected_version,title,
+                      deadline_expression,state,retry_at,expires) VALUES(?,?,?,?,?,?,?,?,'pending',?,0)""",
+                   (intent_id, owner, draft["id"], draft["mode"], task_id, draft["expected_version"], draft["title"], expression, stamp))
+        db.execute("UPDATE drafts SET step='pending',intent_id=? WHERE owner=? AND id=?", (intent_id, owner, draft["id"]))
+        return {"action": "flow_intent"}
+
+    def _draft_input(self, db, owner, stamp, text=None, quick=None, nonce=None):
+        old = db.execute("SELECT * FROM drafts WHERE owner=?", (owner,)).fetchone()
+        self._expire_drafts(db, stamp)
+        draft = db.execute("SELECT * FROM drafts WHERE owner=?", (owner,)).fetchone()
+        if not draft or (nonce is not None and draft["nonce"] != nonce):
+            return {"action": "flow_notice", "notice": "Диалог истёк или кнопка устарела. Начните заново: /add."} if nonce is not None or old else {"action": "ignore"}
+        if draft["step"] == "pending":
+            return {"action": "flow_prompt"}
+        if draft["step"] == "title":
+            if quick is not None or not self._valid_title(text):
+                return {"action": "flow_prompt", "note": "Название должно быть одной строкой до 2000 символов, без 🔔, служебных комментариев и блоков кода."}
+            db.execute("UPDATE drafts SET title=?,step='deadline' WHERE owner=?", (text.strip(), owner))
+            return {"action": "flow_prompt"}
+        if quick == "none":
+            expression, error = None, None
+        elif quick in ("twohours", "tomorrow"):
+            local = dt.datetime.fromtimestamp(stamp, dt.timezone.utc).astimezone(_ASTANA)
+            if quick == "twohours":
+                target = local + dt.timedelta(hours=2)
+                if target.second or target.microsecond:
+                    target += dt.timedelta(minutes=1)
+                target = target.replace(second=0, microsecond=0)
+            else:
+                target = dt.datetime.combine(local.date() + dt.timedelta(days=1), dt.time(9), _ASTANA)
+            expression, error = target.strftime("%Y-%m-%d %H:%M"), None
+        else:
+            expression, error = self._deadline(text, stamp)
+        if error:
+            return {"action": "flow_prompt", "note": "Этот срок уже прошёл. Выберите будущее время." if error == "past" else
+                    "Не удалось разобрать дату. Формат: YYYY-MM-DD HH:MM или «сегодня/завтра HH:MM»."}
+        return self._queue_intent(db, owner, draft, expression, stamp)
+
+    def _open_deadline_edit(self, owner, task_id, expected_version, stamp):
+        try:
+            if self.task_provider is None:
+                raise ValueError
+            rows = self.task_provider()
+            if not isinstance(rows, list):
+                raise ValueError
+            row = next((item for item in rows if isinstance(item, dict) and str(item.get("task_id", "")).lower() == task_id), None)
+        except Exception:
+            return "Не удалось получить свежий список задач. Попробуйте немного позже.", self.keyboard()
+        if row is None or row.get("state") in ("completed", "deleted"):
+            return "Задача больше не найдена среди активных. Откройте свежий список /tasks.", self.keyboard()
+        if _integer(row.get("schedule_version")) != expected_version or expected_version <= 0:
+            return "Задача изменилась. Используйте кнопку в свежем списке /tasks.", self.keyboard()
+        with self._db() as db:
+            self._expire_drafts(db, stamp)
+            draft = db.execute("SELECT * FROM drafts WHERE owner=?", (owner,)).fetchone()
+            if draft and not (draft["mode"] == "edit" and draft["task_id"] == task_id and draft["expected_version"] == expected_version):
+                return "Сначала завершите текущий диалог или отмените его командой /cancel.", self._draft_keyboard(draft)
+            if not draft:
+                db.execute("""INSERT INTO drafts(owner,id,nonce,mode,step,title,task_id,expected_version,expires)
+                              VALUES(?,?,?,'edit','deadline',?,?,?,?)""",
+                           (owner, str(uuid.uuid4()), self._nonce(), _clean_text(row.get("text")), task_id, expected_version, stamp + _DRAFT_TTL))
+                draft = db.execute("SELECT * FROM drafts WHERE owner=?", (owner,)).fetchone()
+            return self._draft_prompt(draft)
+
+    def _flush_intents(self, token, owner, stamp):
+        """Retry committed intents and confirmations separately; never log titles."""
+        error = None
+        with self._db() as db:
+            self._expire_drafts(db, stamp)
+            pending = db.execute("SELECT * FROM intents WHERE owner=? AND state='pending' AND retry_at<=? ORDER BY retry_at,id LIMIT 1", (owner, stamp)).fetchall()
+        for intent in pending:
+            with self._db() as db:
+                db.execute("UPDATE intents SET attempts=attempts+1,retry_at=? WHERE id=? AND state='pending'", (stamp + 5, intent["id"]))
+            try:
+                handler = self.create_task_handler if intent["kind"] == "create" else self.set_deadline_handler
+                if handler is None:
+                    result = "busy"
+                elif intent["kind"] == "create":
+                    response = handler(intent["task_id"], intent["title"], intent["deadline_expression"])
+                    result = response.get("status") if isinstance(response, dict) else "busy"
+                else:
+                    response = handler(intent["task_id"], intent["expected_version"], intent["deadline_expression"])
+                    result = response.get("status") if isinstance(response, dict) else "busy"
+            except Exception:
+                result = "busy"
+            successes = ("created", "already_exists") if intent["kind"] == "create" else ("updated", "already_updated")
+            failures = ("changed", "not_found", "invalid_text", "invalid_deadline", "invalid_task_id")
+            if result in successes or result in failures:
+                with self._db() as db:
+                    db.execute("UPDATE intents SET state=?,result=?,notified=0 WHERE id=? AND state='pending'",
+                               ("done" if result in successes else "failed", result, intent["id"]))
+                    if result in ("invalid_text", "invalid_deadline"):
+                        db.execute("UPDATE drafts SET step=?,nonce=?,intent_id=NULL,expires=? WHERE owner=? AND intent_id=?",
+                                   ("title" if result == "invalid_text" else "deadline", self._nonce(), stamp + _DRAFT_TTL, owner, intent["id"]))
+                    else:
+                        db.execute("DELETE FROM drafts WHERE owner=? AND intent_id=?", (owner, intent["id"]))
+            elif intent["notice"] != "busy":
+                try:
+                    with self._db() as db:
+                        draft = db.execute("SELECT * FROM drafts WHERE owner=? AND intent_id=?", (owner, intent["id"])).fetchone()
+                    self._send(token, owner, "Файл сейчас занят. Сохранение повторится автоматически. Для отмены: /cancel.",
+                               self._draft_keyboard(draft) if draft else self.keyboard())
+                    with self._db() as db:
+                        db.execute("UPDATE intents SET notice='busy' WHERE id=?", (intent["id"],))
+                except ControlsError:
+                    error = "telegram_unavailable"
+        with self._db() as db:
+            notices = db.execute("SELECT id,kind,result FROM intents WHERE owner=? AND state IN ('done','failed') AND notified=0 ORDER BY retry_at LIMIT 5", (owner,)).fetchall()
+        for notice in notices:
+            result = notice["result"]
+            if result in ("created", "already_exists", "updated", "already_updated"):
+                text = ("✅ Задача создана. " if notice["kind"] == "create" else "✅ Срок задачи обновлён. ") + "Сохранено на сервере. Появится в Obsidian после синхронизации."
+            else:
+                text = {"changed": "Задача изменилась. Сохранение отменено; откройте свежий список /tasks.",
+                        "not_found": "Задача больше не найдена. Откройте свежий список /tasks.",
+                        "invalid_text": "Название не подходит. Напишите одну строку до 2000 символов без служебных элементов.",
+                        "invalid_deadline": "Не удалось сохранить этот срок. Выберите будущее время в формате YYYY-MM-DD HH:MM.",
+                        "invalid_task_id": "Не удалось сохранить задачу. Начните новый диалог /add."}.get(result, "Не удалось сохранить задачу. Откройте /tasks и проверьте её.")
+            try:
+                with self._db() as db:
+                    draft = db.execute("SELECT * FROM drafts WHERE owner=?", (owner,)).fetchone()
+                self._send(token, owner, text, self._draft_keyboard(draft) if draft else self.keyboard())
+                with self._db() as db:
+                    db.execute("UPDATE intents SET notified=1 WHERE id=?", (notice["id"],))
+            except ControlsError:
+                error = "telegram_unavailable"
+        return error
+
+    @staticmethod
     def _owner_message(message, owner, sender=None):
         if not isinstance(message, dict):
             return False
@@ -470,7 +712,18 @@ class BotControls:
                 data = callback.get("data")
                 done = _DONE.fullmatch(data) if isinstance(data, str) and len(data) <= 64 else None
                 view = _VIEW.fullmatch(data) if isinstance(data, str) and len(data) <= 64 else None
-                if done:
+                edit = _EDIT.fullmatch(data) if isinstance(data, str) and len(data) <= 64 else None
+                draft_action = _DRAFT.fullmatch(data) if isinstance(data, str) and len(data) <= 64 else None
+                if data == "draft:add":
+                    action.update(self._start_draft(db, owner, stamp))
+                elif draft_action:
+                    if draft_action[2] == "cancel":
+                        action.update(self._cancel_draft(db, owner, stamp, draft_action[1]))
+                    else:
+                        action.update(self._draft_input(db, owner, stamp, quick=draft_action[2], nonce=draft_action[1]))
+                elif edit and int(edit[2]) > 0:
+                    action.update(action="flow_edit_open", task_id=edit[1].lower(), version=int(edit[2]))
+                elif done:
                     action.update(action="done", task_id=done[1].lower(), version=int(done[2]))
                 elif view and (view[1] != "deadlines" or view[2] == "active"):
                     action.update(action="view", view=view[1], state_filter=view[2], page=int(view[3]))
@@ -496,12 +749,19 @@ class BotControls:
                 message = update["message"]
                 date = _timestamp(message.get("date"))
                 text = message.get("text")
-                command = text.split(maxsplit=1)[0].split("@", 1)[0] if isinstance(text, str) and text.strip() else ""
+                command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if isinstance(text, str) and text.strip() else ""
                 if self._owner_message(message, owner) and date is not None and stamp - 300 <= date <= stamp + 60:
-                    if command in ("/start", "/help", "/test", "/menu"):
+                    if command == "/cancel":
+                        action.update(self._cancel_draft(db, owner, stamp))
+                    elif command == "/add":
+                        parts = text.strip().split(maxsplit=1)
+                        action.update(self._start_draft(db, owner, stamp, parts[1] if len(parts) > 1 else None))
+                    elif command in ("/start", "/help", "/test", "/menu"):
                         action["action"] = "menu"
                     elif command in ("/tasks", "/deadlines"):
                         action.update(action="view", view=command[1:], state_filter="active", page=0)
+                    elif isinstance(text, str) and not text.lstrip().startswith("/"):
+                        action.update(self._draft_input(db, owner, stamp, text=text))
             if action["action"] == "ignore":
                 self._count(db, "ignored")
             return action
@@ -526,12 +786,45 @@ class BotControls:
         text = None
         counter = None
         reply_markup = None
+        # Stop the spinner before fresh Markdown reads or a mutation handler.
+        early_ack = {"view": "Открываю список.", "flow_edit_open": "Проверяю задачу.",
+                     "flow_intent": "Сохраняю.", "flow_prompt": "Продолжим.",
+                     "flow_notice": "Готово."}.get(kind)
+        acknowledged = False
+        if early_ack and action.get("callback_id"):
+            acknowledged = True
+            try:
+                self._ack(token, action["callback_id"], early_ack)
+            except ControlsError:
+                error = "telegram_unavailable"
         if kind == "menu":
             text, counter = self._menu_text(), "menus_sent"
             ack = "Главное меню."
         elif kind == "view":
             text, reply_markup = self._view_message(action["view"], action["state_filter"], action["page"], stamp)
             counter, ack = "views_sent", "Список обновлён."
+        elif kind == "flow_prompt":
+            try:
+                with self._db() as db:
+                    draft = db.execute("SELECT * FROM drafts WHERE owner=?", (owner,)).fetchone()
+                if draft:
+                    text, reply_markup = self._draft_prompt(draft, action.get("note"))
+                else:
+                    text = "Диалог истёк. Начните заново: /add."
+            except sqlite3.Error:
+                error = "storage_unavailable"
+        elif kind == "flow_edit_open":
+            try:
+                text, reply_markup = self._open_deadline_edit(owner, action["task_id"], action["version"], stamp)
+            except sqlite3.Error:
+                error = "storage_unavailable"
+        elif kind == "flow_notice":
+            text = action["notice"]
+        elif kind == "flow_intent":
+            try:
+                error = self._flush_intents(token, owner, stamp) or error
+            except sqlite3.Error:
+                error = "storage_unavailable"
         elif kind == "ping":
             text, counter = "✅ Бот работает. Сообщения доходят.", "pings_sent"
         elif kind == "status":
@@ -558,7 +851,7 @@ class BotControls:
             counter = "completed_actions" if result == "completed" else None
         # An acknowledgement error must not prevent a committed local test/action
         # from running or cause a replay to run that action again.
-        if action.get("callback_id") and ack:
+        if action.get("callback_id") and ack and not acknowledged:
             try:
                 self._ack(token, action["callback_id"], ack)
             except ControlsError:
@@ -637,6 +930,7 @@ class BotControls:
                         break
             except ControlsError:
                 error = "telegram_unavailable"
+            error = self._flush_intents(token, owner, stamp) or error
             error = self._deliver_tests(token, owner, stamp) or error
         except sqlite3.Error:
             error = "storage_unavailable"

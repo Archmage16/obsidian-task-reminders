@@ -17,7 +17,9 @@ class BotService:
         self.engine = engine or TaskEngine(config_path)
         self.controls = controls or BotControls(self.engine.data_dir, self.control_status,
                                                 complete_task_handler=self.complete_task,
-                                                task_provider=self.task_list)
+                                                task_provider=self.task_list,
+                                                create_task_handler=self.create_task,
+                                                set_deadline_handler=self.set_deadline)
         self.last_sync = None
         self.drain_pending = False
         self.status_path = self.engine.data_dir / 'service-status.json'
@@ -36,6 +38,18 @@ class BotService:
 
     def complete_task(self, task_id, expected_version):
         return self.engine.complete_task(task_id, expected_version, _lock_held=True)
+
+    def create_task(self, draft_id, title, deadline_expression):
+        result = self.engine.create_task(title, deadline_expression, task_id=draft_id, _lock_held=True)
+        if result.get('status') in ('created', 'already_exists'):
+            self.last_sync = None
+        return result
+
+    def set_deadline(self, task_id, expected_version, deadline_expression):
+        result = self.engine.set_deadline(task_id, expected_version, deadline_expression, _lock_held=True)
+        if result.get('status') in ('updated', 'already_updated'):
+            self.last_sync = None
+        return result
 
     def task_list(self):
         # Read the current synchronized file for every view, without sending
@@ -69,6 +83,7 @@ class BotService:
                     'telegram_configured': bool(token and chat_id),
                     'engine_error': engine_error or self.engine.status().get('error'),
                     'controls_error': control_result.get('error'),
+                    'pending_task_writes': control_result.get('pending_actions', 0),
                     'repeat_seconds': self.engine.config.repeat_seconds,
                     'task_poll_seconds': self.engine.config.poll_seconds}
         temporary = self.status_path.with_suffix('.tmp')
